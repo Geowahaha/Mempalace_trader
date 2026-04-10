@@ -12,6 +12,7 @@ build/
 dist/
 data/
 logs/
+reports/
 *.log
 *.out
 *.err

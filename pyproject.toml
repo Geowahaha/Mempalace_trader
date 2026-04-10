@@ -24,6 +24,7 @@ mempalace-trader-loop = "trading_ai.main:main"
 mempalace-trader-api = "trading_ai.api:main"
 mempalace-trader-daily-analyst = "trading_ai.daily_analyst:main"
 mempalace-trader-selftest-memory = "trading_ai.selftest_memory:main"
+mempalace-dexter-edge-audit = "trading_ai.dexter_edge_audit:main"
 
 [tool.setuptools.packages.find]
 include = ["trading_ai*"]
