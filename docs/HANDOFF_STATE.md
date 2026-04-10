@@ -1,6 +1,6 @@
 # Mempalace Trader Handoff State
 
-Last updated: 2026-04-10 18:35 Asia/Bangkok
+Last updated: 2026-04-10 19:53 Asia/Bangkok
 
 Read this file first when continuing the project in a new chat/session. It is intentionally written without API keys, tokens, passwords, account logins, private keys, or local export data.
 
@@ -16,10 +16,12 @@ Continue Mempalace Trader from D:\Mempalac_AI. Read docs/HANDOFF_STATE.md first,
 - Remote: `https://github.com/Geowahaha/Mempalace_trader.git`
 - Branch: `main`
 - Latest pushed commits:
+  - `2196a60 Add read-only Dexter edge auditor`
+  - `0ffe6d3 Add Mempalace handoff state`
   - `aa3750f Add safe Mempalac stop script`
   - `30aceed Initial Mempalace production trading engine`
 - The local untracked file `start_stop ระบบ Mempalace ai.txt` is user-local and should not be staged unless explicitly requested.
-- Git ignore rules intentionally exclude `.env`, `.env.*`, `.venv`, `data`, `logs`, Chroma/db files, account exports, ssh keys, and local notes.
+- Git ignore rules intentionally exclude `.env`, `.env.*`, `.venv`, `data`, `logs`, `reports`, Chroma/db files, account exports, ssh keys, and local notes.
 
 ## Current runtime state
 
@@ -200,6 +202,60 @@ Relevant scripts:
 .\scripts\run-daily-analyst.ps1
 ```
 
+## Dexter edge audit state
+
+Mempalace now includes a read-only Dexter auditor. It is designed to help Dexter without interfering with it:
+
+- Code: `D:\Mempalac_AI\trading_ai\dexter_edge_audit.py`
+- Runner: `D:\Mempalac_AI\scripts\run-dexter-edge-audit.ps1`
+- Console entry point: `mempalace-dexter-edge-audit`
+- Local report path: `D:\Mempalac_AI\reports\DEXTER_EDGE_AUDIT.md`
+- `reports/` is ignored and should not be pushed because it contains private trading performance and edge evidence.
+
+Run the current audit again:
+
+```powershell
+cd D:\Mempalac_AI
+.\scripts\run-dexter-edge-audit.ps1 -TradeExport "D:\path\to\ctrader_trade_export.xlsx" -MaxEnvKeys 360
+```
+
+The auditor reads:
+
+- Dexter cTrader SQLite DB in read-only mode
+- Dexter backtest SQLite DB in read-only mode
+- Optional cTrader XLSX trade export
+- Dexter `.env.local` in sanitized mode only
+
+Sanitization rules:
+
+- Do not print tokens, passwords, client secrets, account identifiers, private keys, Telegram IDs, webhook URLs, or raw API payloads.
+- Only trading behavior keys are shown, such as risk, lot/volume, fibo, XAU, BTC, canary, gates, thresholds, sessions, and live/demo flags.
+- Do not copy full `.env.local` into chat or commits.
+
+Latest audit generated locally at `D:\Mempalac_AI\reports\DEXTER_EDGE_AUDIT.md`.
+
+Important findings from the latest audit:
+
+- Broker-side export had 277 closed trades, total PnL about `+112.16 USD`, win rate about `38.6%`, and max drawdown about `-155.20 USD`.
+- `XAUUSD buy` in the export was weak: 181 trades, about `-53.83 USD`, win rate about `34.3%`.
+- `XAUUSD sell` in the export was strong: 17 trades, about `+89.96 USD`, win rate about `58.8%`.
+- `BTCUSD buy` in the export was strong: 27 trades, about `+72.29 USD`, win rate about `66.7%`.
+- Bad export days: `2026-04-07` about `-132.16 USD`, `2026-04-09` about `-55.82 USD`.
+- Good export day: `2026-04-08` about `+110.78 USD`.
+- Dexter DB shows the strongest immediate red flag is `fibo_xauusd` short: 22 trades, about `-111.25 USD`, win rate `0.0%`.
+- Dexter DB shows `fibo_xauusd` long was positive, so do not kill the whole fibo family blindly. Quarantine/review the short side first.
+- BTC quantity `0.05` appears explained by Dexter `.env.local` value `CTRADER_DEFAULT_VOLUME_SYMBOL_OVERRIDES=BTCUSD=5`; the worker uses `fixed_volume` before risk-based sizing.
+- This means BTC volume increase was not proven to be AI auto-learning. It was likely a fixed symbol override that happened to perform well in that sample.
+
+Safe Dexter improvement plan:
+
+- Keep Dexter as executor and proven strategy host.
+- Use Mempalace as read-only memory/evidence/governance first.
+- Protect winner lanes before removing bad lanes.
+- Candidate protect lanes include `xauusd_scheduled:canary` short/long, `scalp_xauusd:fss:canary` long, and `scalp_btcusd:canary` short.
+- Candidate quarantine lanes include `fibo_xauusd` short, weak XAU canary base lanes, and selected `pb/bs/td` lanes only after human approval.
+- Do not patch Dexter live logic until the user explicitly approves a branch/rollback plan.
+
 ## Current behavior observed
 
 Recent live-demo loop behavior:
@@ -226,6 +282,8 @@ Recent live-demo loop behavior:
    - current open position state
 7. Add explicit broker position reconciliation so startup can detect externally-opened demo positions, not only positions opened and persisted by Mempalace.
 8. Consider a shadow-trade mode for candidate lanes: record would-have-traded signals without broker execution until enough memory exists.
+9. Add a Mempalace daily Dexter audit summary that stores `winner rooms`, `danger rooms`, and BTC/XAU sizing observations into MemPalace memory without changing Dexter.
+10. If approved later, implement a Dexter-side hard gate for `fibo_xauusd` short only, preserving `fibo_xauusd` long and all currently profitable lanes.
 
 ## Safety rules for future agents
 
