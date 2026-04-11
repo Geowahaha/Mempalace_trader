@@ -47,7 +47,7 @@ Start-Process powershell `
     -RedirectStandardError $loopErr | Out-Null
 
 Write-Host "Started local live-demo stack."
-Write-Host "Dashboard: http://127.0.0.1:8091/dashboard"
+Write-Host "Dashboard: http://127.0.0.1:8080/dashboard"
 Write-Host "API out:    $apiLog"
 Write-Host "API err:    $apiErr"
 Write-Host "Loop out:   $loopLog"

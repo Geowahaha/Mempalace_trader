@@ -59,6 +59,7 @@ class CloseDetail:
     entry_price: float
     exit_price: float
     pnl: float
+    position_id: Optional[str] = None
 
     def notional_approx(self) -> float:
         return abs(self.volume * self.entry_price)
@@ -84,6 +85,7 @@ class ExecutionOutcome:
 
     trade: TradeResult
     close: Optional[CloseDetail] = None
+    closes: list[CloseDetail] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -125,24 +127,55 @@ class Broker(Protocol):
 
 class ExecutionService:
     """
-    Per-symbol book: at most one open position per symbol; no duplicate same-side adds.
-    Opposite signal closes existing first. If close fails in live mode, it will not open
-    the opposite leg, which prevents accidental hedging or doubling exposure.
+    Per-symbol position book.
+
+    Same-side entries may pyramid if the caller's risk gate allows it. Opposite
+    signals close all tracked positions first. If any close fails in live mode,
+    it will not open the opposite leg, which prevents accidental hedging.
     """
 
     def __init__(self, broker: Broker) -> None:
         self._broker = broker
-        self._positions: Dict[str, OpenPosition] = {}
+        self._positions: Dict[str, list[OpenPosition]] = {}
 
     @property
     def positions(self) -> Dict[str, OpenPosition]:
-        return dict(self._positions)
+        return {symbol: positions[-1] for symbol, positions in self._positions.items() if positions}
+
+    def positions_for(self, symbol: str) -> list[OpenPosition]:
+        return list(self._positions.get(symbol) or [])
 
     def open_position_for(self, symbol: str) -> Optional[OpenPosition]:
-        return self._positions.get(symbol)
+        positions = self._positions.get(symbol) or []
+        if not positions:
+            return None
+        if len(positions) == 1:
+            return positions[0]
+        total_volume = sum(max(0.0, p.volume) for p in positions)
+        if total_volume <= 0:
+            return positions[-1]
+        side = positions[-1].side
+        avg_entry = sum(p.entry_price * max(0.0, p.volume) for p in positions) / total_volume
+        return OpenPosition(
+            order_id="aggregate",
+            symbol=symbol,
+            side=side,
+            volume=total_volume,
+            entry_price=avg_entry,
+            position_id=None,
+            opened_ts=min(p.opened_ts for p in positions),
+        )
+
+    def total_volume(self, symbol: str, side: Optional[Side] = None) -> float:
+        positions = self._positions.get(symbol) or []
+        return sum(p.volume for p in positions if side is None or p.side == side)
 
     def restore_position(self, position: OpenPosition) -> None:
-        self._positions[position.symbol] = position
+        self._positions.setdefault(position.symbol, []).append(position)
+
+    def restore_positions(self, positions: list[OpenPosition]) -> None:
+        for position in positions:
+            self.restore_position(position)
 
     async def get_market_data(self, symbol: str) -> MarketSnapshot:
         return await self._broker.get_market_data(symbol)
@@ -171,78 +204,83 @@ class ExecutionService:
                 )
             )
 
-        existing = self._positions.get(symbol)
-        if existing is not None and existing.side == action:
-            log.info(
-                "Position control: skip %s %s - already open (one position per symbol)",
-                action,
-                symbol,
-            )
-            return ExecutionOutcome(
-                trade=TradeResult(
-                    order_id="skip_same_side",
-                    symbol=symbol,
-                    side=action,
-                    volume=0.0,
-                    entry_price=existing.entry_price,
-                    executed=False,
-                    dry_run=dry_run,
-                    message="skip_same_side_open",
-                    position_id=existing.position_id,
-                    raw_response={"reason": decision_reason},
-                )
-            )
+        existing_positions = list(self._positions.get(symbol) or [])
+        same_side_open = bool(existing_positions and all(p.side == action for p in existing_positions))
 
+        closes: list[CloseDetail] = []
         close: Optional[CloseDetail] = None
-        if existing is not None:
-            prev = existing
-            close_result = await self._broker.close_position(
-                symbol=prev.symbol,
-                position=prev,
-                reason=f"flip_to_{action}:{decision_reason}",
-                dry_run=dry_run,
-            )
-            if not close_result.closed and not dry_run:
-                log.error(
-                    "Position control: failed to close %s %s before %s: %s",
+        if existing_positions and not same_side_open:
+            remaining = list(existing_positions)
+            for prev in existing_positions:
+                close_result = await self._broker.close_position(
+                    symbol=prev.symbol,
+                    position=prev,
+                    reason=f"flip_to_{action}:{decision_reason}",
+                    dry_run=dry_run,
+                )
+                if not close_result.closed and not dry_run:
+                    log.error(
+                        "Position control: failed to close %s %s position_id=%s before %s: %s",
+                        prev.side,
+                        prev.symbol,
+                        prev.position_id,
+                        action,
+                        close_result.message,
+                    )
+                    return ExecutionOutcome(
+                        trade=TradeResult(
+                            order_id="close_failed",
+                            symbol=symbol,
+                            side=action,
+                            volume=0.0,
+                            entry_price=prev.entry_price,
+                            executed=False,
+                            dry_run=False,
+                            message=f"close_failed:{close_result.message}",
+                            position_id=prev.position_id,
+                            raw_response=close_result.raw_response,
+                        ),
+                        close=close,
+                        closes=closes,
+                    )
+                sign = 1.0 if prev.side == "BUY" else -1.0
+                realized = sign * (close_result.exit_price - prev.entry_price) * prev.volume
+                detail = CloseDetail(
+                    symbol=prev.symbol,
+                    side=prev.side,
+                    volume=prev.volume,
+                    entry_price=prev.entry_price,
+                    exit_price=close_result.exit_price,
+                    pnl=realized,
+                    position_id=prev.position_id,
+                )
+                closes.append(detail)
+                remaining = [p for p in remaining if p is not prev]
+                log.info(
+                    "Closed position %s %s position_id=%s @ %.5f -> %.5f PnL~%.5f",
                     prev.side,
                     prev.symbol,
-                    action,
-                    close_result.message,
+                    prev.position_id,
+                    prev.entry_price,
+                    close_result.exit_price,
+                    realized,
                 )
-                return ExecutionOutcome(
-                    trade=TradeResult(
-                        order_id="close_failed",
+            self._positions[symbol] = remaining
+            if not remaining:
+                del self._positions[symbol]
+            if closes:
+                total_volume = sum(c.volume for c in closes)
+                if total_volume > 0:
+                    avg_entry = sum(c.entry_price * c.volume for c in closes) / total_volume
+                    avg_exit = sum(c.exit_price * c.volume for c in closes) / total_volume
+                    close = CloseDetail(
                         symbol=symbol,
-                        side=action,
-                        volume=0.0,
-                        entry_price=prev.entry_price,
-                        executed=False,
-                        dry_run=False,
-                        message=f"close_failed:{close_result.message}",
-                        position_id=prev.position_id,
-                        raw_response=close_result.raw_response,
+                        side=closes[-1].side,
+                        volume=total_volume,
+                        entry_price=avg_entry,
+                        exit_price=avg_exit,
+                        pnl=sum(c.pnl for c in closes),
                     )
-                )
-            sign = 1.0 if prev.side == "BUY" else -1.0
-            realized = sign * (close_result.exit_price - prev.entry_price) * prev.volume
-            close = CloseDetail(
-                symbol=prev.symbol,
-                side=prev.side,
-                volume=prev.volume,
-                entry_price=prev.entry_price,
-                exit_price=close_result.exit_price,
-                pnl=realized,
-            )
-            log.info(
-                "Closed position %s %s @ %.5f -> %.5f PnL~%.5f",
-                prev.side,
-                prev.symbol,
-                prev.entry_price,
-                close_result.exit_price,
-                realized,
-            )
-            del self._positions[symbol]
 
         tr = await self._broker.execute_trade(
             symbol=symbol,
@@ -253,16 +291,18 @@ class ExecutionService:
         )
         if tr.executed or dry_run:
             act: Side = action  # type: ignore[assignment]
-            self._positions[symbol] = OpenPosition(
-                order_id=tr.order_id,
-                symbol=tr.symbol,
-                side=act,
-                volume=tr.volume,
-                entry_price=tr.entry_price,
-                position_id=tr.position_id,
-                opened_ts=tr.ts_unix,
+            self._positions.setdefault(symbol, []).append(
+                OpenPosition(
+                    order_id=tr.order_id,
+                    symbol=tr.symbol,
+                    side=act,
+                    volume=tr.volume,
+                    entry_price=tr.entry_price,
+                    position_id=tr.position_id,
+                    opened_ts=tr.ts_unix,
+                )
             )
-        return ExecutionOutcome(trade=tr, close=close)
+        return ExecutionOutcome(trade=tr, close=close, closes=closes)
 
     def force_flat(self) -> None:
         self._positions.clear()

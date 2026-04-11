@@ -1,6 +1,6 @@
 # Mempalace Trader Handoff State
 
-Last updated: 2026-04-10 19:53 Asia/Bangkok
+Last updated: 2026-04-11 11:38 Asia/Bangkok
 
 Read this file first when continuing the project in a new chat/session. It is intentionally written without API keys, tokens, passwords, account logins, private keys, or local export data.
 
@@ -23,26 +23,114 @@ Continue Mempalace Trader from D:\Mempalac_AI. Read docs/HANDOFF_STATE.md first,
 - The local untracked file `start_stop ระบบ Mempalace ai.txt` is user-local and should not be staged unless explicitly requested.
 - Git ignore rules intentionally exclude `.env`, `.env.*`, `.venv`, `data`, `logs`, `reports`, Chroma/db files, account exports, ssh keys, and local notes.
 
+## Latest Dexter XAU audit and patch
+
+- New local audit report: `D:\Mempalac_AI\reports\DEXTER_XAU_GIVEBACK_AUDIT_2026-04-10.md`
+- Statement reviewed: `D:\dexter_pro_v3_fixed\cT_9900897_2026-04-10_23-29.xlsx`
+- Finding: XAU giveback is real. From 91 XAU closed positions with usable tick coverage, 42 losers had first moved profitable by more than `0.5` XAU points, and 26 losers had first moved profitable by at least `2.0` XAU points.
+- Finding: 2026-04-10 no-order symptom is mostly operational, not signal absence. Dexter journal shows `account_auth_failed: Invalid access token` for scheduled XAU entries and `family_position_cap:XAUUSD:xau_scalp_microtrend:1` for many scalp entries.
+- Dexter patch applied in `D:\dexter_pro_v3_fixed\dexter_pro_v3_fixed`:
+  - Fibo short quarantine and golden-pocket/momentum quality gates were added earlier in this session.
+  - Source-direction quarantine/protected lane governance was added earlier in this session.
+  - XAU active-defense profit-seeking guard was added: if a XAU position is already profitable by configured R, active defense tightens/protects instead of closing, and TP trimming is suppressed while profit-seeking is active.
+- Verification passed:
+  - `python -m py_compile config.py execution\ctrader_executor.py scanners\fibo_advance.py`
+  - `python -m pytest tests\test_trading_manager_agent.py tests\test_trading_team.py -q`
+  - Result: `31 passed, 1 warning`
+- Operational blocker remains: Dexter needs valid cTrader OpenAPI auth before broker sync/execution can work again. Patch is code-ready but running Dexter process must be restarted/redeployed deliberately after auth is fixed.
+
+## Dexter VM deployment state
+
+- Important correction: the real Dexter trading service runs on the Oracle VM, not on this PC.
+- Local PC Dexter is now safety-only:
+  - `CTRADER_DRY_RUN=1`
+  - `MT5_DRY_RUN=1`
+  - local `main.py monitor` process was stopped to avoid duplicate execution against the VM.
+- VM app path: `/opt/dexter_pro`
+- VM service: `dexter-monitor` via `systemd`
+- VM branch now loaded: `deploy-xau-family-canary`
+- VM commit now loaded: `778d846` (`Harden XAU fibo and profit governance`)
+- VM auth note:
+  - the older note that VM auth had already been fixed should now be treated as stale
+  - later checks in this session showed the same cTrader auth family failing with invalid/revoked token behavior
+  - do not assume the VM is broker-synced until it is rechecked explicitly with fresh tokens
+- VM verification notes:
+  - `py_compile` for patched files passed on VM.
+  - VM venv does not currently have `pytest`, so full pytest was not run on VM.
+  - Local PC pytest passed before deploy: `31 passed, 1 warning`.
+- VM source-control note:
+  - Branch was pushed to GitHub remote `dexter` as `deploy-xau-family-canary`.
+  - The workflow auto-deploys only `main`; this branch deploy was manually checked out on VM for controlled rollout.
+  - Consider merging to `main` only after observing VM behavior and deciding the patch is stable.
+
 ## Current runtime state
 
-- Mempalace is running on this PC as normal PowerShell/Python processes, not as a Windows service.
-- Current API process command: `python.exe -m trading_ai.api`
-- Current loop process command: `python.exe -m trading_ai --interval 30 --no-dry-run`
-- Current dashboard: `http://127.0.0.1:8091/dashboard`
-- Current status from `/status`:
-  - `instance_name=mempalac`
-  - `symbol=XAUUSD`
-  - `llm_provider=LOCAL`
-  - `dry_run_default=false`
-  - `live_execution_enabled=true`
-  - `memory_count=107`
-  - `trade_memory_count=0`
-  - `note_memory_count=107`
-- Current `runtime_state.json`:
-  - `open_position=null`
+- As of `2026-04-11 11:38 Asia/Bangkok`, local Mempalace stack is running again on this PC.
+- Current API/dashboard port is `8080` (not `8091`).
+- Config loading was corrected on `2026-04-11`: [config.py](D:/Mempalac_AI/trading_ai/config.py) now loads the repo-root `.env` as the canonical settings source.
+- Reason: local root `.env` and `trading_ai/.env` had diverged token pairs; the old setup could silently keep using stale worker credentials.
+- Worker interpreter resolution was also hardened:
+  - [ctrader_dexter_worker.py](D:/Mempalac_AI/trading_ai/integrations/ctrader_dexter_worker.py) now auto-discovers `trading_ai\.venv\Scripts\python.exe` when Dexter local has no `.venv`
+- Current environment defaults loaded from local `.env`:
+  - `dry_run=True`
+  - `live_execution_enabled=False`
+  - `ctrader_dexter_worker=True`
+  - `quote_source=auto`
+- Live runtime overrides applied by startup script:
+  - `DRY_RUN=false`
+  - `LIVE_EXECUTION_ENABLED=true`
+  - `LLM_PROVIDER=local`
+  - `CTRADER_QUOTE_SOURCE=dexter_reference`
+- Current `runtime_state.json` path: `D:\Mempalac_AI\data\runtime_state.json`
+- Current saved runtime state shows one prior live-demo position:
+  - `open_position=BUY XAUUSD 0.01`
   - `trades_executed=0`
   - `consecutive_losses=0`
   - `halted=false`
+- Current broker health on this PC:
+  - resolved on `2026-04-11` after running a full production OAuth authorization-code exchange against `http://localhost:5000/callback`
+  - fresh tokens were written into both:
+    - `D:\Mempalac_AI\.env`
+    - `D:\dexter_pro_v3_fixed\dexter_pro_v3_fixed\.env.local`
+  - verified:
+    - Mempalace `accounts` => `ok`
+    - Mempalace `health` => `ok`, `environment=demo`, configured `account_login=9969200`
+    - Dexter read-only worker probes also pass with the updated env
+- Runtime verification after auth fix and restart:
+  - `/status` => `ok`
+  - `/broker/health` => `ok`, `account_id=46945293`, `environment=demo`
+  - `/runtime/state` => `ok`
+  - loop log restores the open XAUUSD demo position and continues to HOLD on `ASIA + RANGE + LOW volatility`
+- Local code is ahead of runtime:
+  - multi-position runtime state support is patched
+  - same-side add-on entries are patched
+  - opposite-side signal now closes all tracked same-symbol positions before opening the reverse leg
+  - equity-based max-total-lot cap is patched
+  - XAU and fibo scanners now fail open when capture is genuinely unavailable instead of translating missing capture into `low_tick_velocity:0.000`
+  - XAU shadow backtest now falls back to `ctrader_spot_ticks` when candle DB exists but the requested time window is empty
+  - verification passed on code only: `python -m py_compile ...`
+  - logic test passed in repo venv: two BUY positions can coexist, and a later SELL closes both BUYs before opening one SELL
+  - targeted Dexter verification passed locally:
+    - `python -m pytest tests\test_scanner_capture_passthrough.py -q`
+    - `python -m pytest tests\test_live_profile_autopilot.py -q -k "latest_capture_feature_snapshot_filters_rows_by_symbol_within_run or run_xau_shadow_backtest_falls_back_to_spot_ticks_when_candle_window_is_empty"`
+  - note: full `tests\test_live_profile_autopilot.py` still has unrelated existing failures not caused by this patch
+- These local code changes are active again in the local Mempalace trading loop.
+- Current observed loop behavior after restart:
+  - broker auth/execution path works
+  - API dashboard works on `http://127.0.0.1:8080/dashboard`
+  - loop is currently returning `HOLD` because the pre-LLM hard filter sees `ASIA + RANGE + LOW volatility`, not because of auth failure
+- cTrader reconcile volume note:
+  - broker reconcile returns raw `volume=100` for the currently open Mempalace XAUUSD 0.01-lot demo position
+  - Mempalace startup reconcile now converts this back into lot-sized runtime units before restoring positions
+  - targeted test added:
+    - `D:\Mempalac_AI\tests\test_ctrader_reconcile.py`
+    - verification passed with stdlib unittest because repo `.venv` currently does not include `pytest`
+      - `D:\Mempalac_AI\.venv\Scripts\python.exe -m unittest D:\Mempalac_AI\tests\test_ctrader_reconcile.py -v`
+      - `D:\Mempalac_AI\.venv\Scripts\python.exe -m py_compile D:\Mempalac_AI\trading_ai\main.py D:\Mempalac_AI\trading_ai\config.py D:\Mempalac_AI\tests\test_ctrader_reconcile.py`
+- Runtime-state correction note:
+  - root runtime state at `D:\Mempalac_AI\data\runtime_state.json` had temporarily drifted to `volume=1.0` during the first broker-reconcile patch
+  - it was corrected from the legacy snapshot at `D:\Mempalac_AI\data\mempalac\runtime_state.json`
+  - a backup of the wrong-scale file exists at `D:\Mempalac_AI\data\runtime_state.json.wrongscale.bak`
 
 Process IDs change after restart. Do not rely on old PIDs except for immediate same-session debugging.
 
@@ -86,7 +174,7 @@ cd D:\Mempalac_AI
 Direct status check:
 
 ```powershell
-Invoke-RestMethod -Uri "http://127.0.0.1:8091/status" -TimeoutSec 10
+Invoke-RestMethod -Uri "http://127.0.0.1:8080/status" -TimeoutSec 10
 ```
 
 Direct Ollama health check:
@@ -131,12 +219,43 @@ Cost note:
   - `DRY_RUN=false`
   - `LIVE_EXECUTION_ENABLED=true`
 - Execution path is via the Dexter worker integration from Mempalace, but Dexter repo itself must not be modified by Mempalace work.
+- Runtime config now reads the repo-root `.env`; keeping secrets only in `trading_ai/.env` is no longer sufficient.
 - Market quote source currently uses the Dexter-reference path instead of the failing native cTrader capture route.
 - Native cTrader route still has unresolved support issue:
   - observed `app_auth_failed`
   - observed `CANT_ROUTE_REQUEST`
   - support/debug bundle should be sent to cTrader/OpenAPI support separately if needed.
+- Current local blocker is different from the old route issue:
+  - the worker now reaches application auth, but account/accounts auth fails because all available access/refresh token pairs appear invalid or revoked
+  - the next required operator action is to mint a fresh cTrader OpenAPI OAuth token pair for the same app/client credentials, then retest `accounts` and `health`
 - Do not print or commit `.env` contents, OpenAPI tokens, refresh tokens, passwords, or account identifiers.
+
+## Tick-capture and shadow-resolution patch state
+
+- Root cause of false `low_tick_velocity:0.000` rejects:
+  - `latest_capture_feature_snapshot()` returns `status=capture_missing` when there is no recent run inside the lookback window
+  - some scanner paths treated missing features as zeros, which could falsely block entries
+- Patch applied in local Dexter repo:
+  - [xauusd.py](D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/scanners/xauusd.py)
+  - [fibo_advance.py](D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/scanners/fibo_advance.py)
+  - scanners now return `micro_capture_unavailable:*` passthrough instead of blocking on zeroed capture metrics when capture is missing
+- Root cause of shadow resolver backlog:
+  - `run_xau_shadow_backtest()` only used `ctrader_spot_ticks` when the whole candle DB file was missing
+  - if the candle DB existed but the requested window had no rows, the resolver skipped the shadow row instead of falling back
+- Patch applied in local Dexter repo:
+  - [live_profile_autopilot.py](D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/learning/live_profile_autopilot.py)
+  - `_fetch_bars()` now falls back per-query to `ctrader_spot_ticks` when candle rows are empty
+- New targeted tests:
+  - [test_scanner_capture_passthrough.py](D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/tests/test_scanner_capture_passthrough.py)
+  - [test_live_profile_autopilot.py](D:/dexter_pro_v3_fixed/dexter_pro_v3_fixed/tests/test_live_profile_autopilot.py)
+
+## NeuralBrain note
+
+- `rng undefined` is not currently reproduced in the checked local code path.
+- Current observations:
+  - `learning/neural_brain.py` and `learning/symbol_neural_brain.py` define RNG objects before use
+  - local mission reports show successful training runs
+- No NeuralBrain patch was applied in this round because there is not yet a reproducible failing path.
 
 ## Risk and decision rules
 

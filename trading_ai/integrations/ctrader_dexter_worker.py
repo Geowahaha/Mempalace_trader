@@ -51,7 +51,21 @@ def _resolve_worker_python(settings: Settings, dexter_root: Path) -> str:
         p = Path(settings.ctrader_worker_python)
         if p.is_file():
             return str(p.resolve())
-    for rel in (Path(".venv") / "Scripts" / "python.exe", Path("venv") / "Scripts" / "python.exe"):
+    search_roots = [
+        dexter_root,
+        Path(__file__).resolve().parent.parent,
+        Path(__file__).resolve().parent,
+    ]
+    rel_candidates = (
+        Path(".venv") / "Scripts" / "python.exe",
+        Path("venv") / "Scripts" / "python.exe",
+    )
+    for root in search_roots:
+        for rel in rel_candidates:
+            cand = root / rel
+            if cand.is_file():
+                return str(cand.resolve())
+    for rel in rel_candidates:
         cand = dexter_root / rel
         if cand.is_file():
             return str(cand.resolve())
@@ -325,6 +339,22 @@ class CTraderDexterWorkerBroker(Broker):
         if self._quote_source() == "paper":
             return True
         return not self._settings.live_execution_enabled
+
+    def get_account_equity(self) -> Optional[float]:
+        """Best-effort balance/equity probe for exposure caps."""
+        data = self._run_worker("health", {"account_id": int(self._account_id)})
+        if not data.get("ok"):
+            log.warning(
+                "Account equity probe failed status=%s message=%s",
+                data.get("status"),
+                str(data.get("message") or "")[:220],
+            )
+            return None
+        for key in ("equity", "balance", "balance_usd"):
+            value = _to_float(data.get(key))
+            if value is not None:
+                return value
+        return None
 
     def _extract_latest_snapshot(self, symbol: str, data: Dict[str, Any]) -> Optional[MarketSnapshot]:
         token = str(symbol).upper().replace(" ", "")

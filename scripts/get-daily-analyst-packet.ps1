@@ -2,7 +2,7 @@ param(
     [string]$OutputPath = ""
 )
 
-$data = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8091/memory/analyst-packet"
+$data = Invoke-RestMethod -Method Get -Uri "http://127.0.0.1:8080/memory/analyst-packet"
 if ($OutputPath) {
     $dir = Split-Path -Parent $OutputPath
     if ($dir) {

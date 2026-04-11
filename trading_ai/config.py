@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(
         env_file=(
-            str(Path(__file__).resolve().with_name(".env")),
+            str(Path(__file__).resolve().parents[1] / ".env"),
             ".env",
         ),
         env_file_encoding="utf-8",
@@ -344,10 +344,54 @@ class Settings(BaseSettings):
         ge=1,
         le=10_000_000,
         validation_alias="CTRADER_WORKER_VOLUME_SCALE",
-        description="fixed_volume=int(round(DEFAULT_VOLUME*scale)). 100 => 0.01 lot -> 1.",
+        description=(
+            "Worker payload scale: fixed_volume=int(round(DEFAULT_VOLUME*scale)). "
+            "With scale=100, 0.01 lot is sent to the Dexter worker as 1. "
+            "cTrader reconcile responses may report that same position as raw volume 100."
+        ),
     )
 
     default_volume: float = Field(default=0.01, validation_alias="DEFAULT_VOLUME")
+    pyramiding_enabled: bool = Field(
+        default=True,
+        validation_alias="PYRAMIDING_ENABLED",
+        description="Allow same-side add-on entries when exposure remains below the equity-based cap.",
+    )
+    pyramid_max_positions_per_side: int = Field(
+        default=3,
+        ge=1,
+        le=20,
+        validation_alias="PYRAMID_MAX_POSITIONS_PER_SIDE",
+    )
+    pyramid_add_min_confidence: float = Field(
+        default=0.70,
+        ge=0.0,
+        le=1.0,
+        validation_alias="PYRAMID_ADD_MIN_CONFIDENCE",
+    )
+    risk_equity_fallback_usd: float = Field(
+        default=1000.0,
+        gt=0.0,
+        validation_alias="RISK_EQUITY_FALLBACK_USD",
+        description="Used for exposure caps when broker balance/equity probe is unavailable.",
+    )
+    risk_max_lot_per_1000_equity: float = Field(
+        default=0.03,
+        gt=0.0,
+        validation_alias="RISK_MAX_LOT_PER_1000_EQUITY",
+        description="Equity-scaled total exposure cap. Example: 0.03 at 1000 USD allows 0.03 total lots.",
+    )
+    risk_max_total_lot_per_symbol: float = Field(
+        default=0.03,
+        gt=0.0,
+        validation_alias="RISK_MAX_TOTAL_LOT_PER_SYMBOL",
+        description="Hard total same-symbol exposure cap after equity scaling.",
+    )
+    risk_min_order_lot: float = Field(
+        default=0.01,
+        gt=0.0,
+        validation_alias="RISK_MIN_ORDER_LOT",
+    )
 
     # --- Strategy evolution v2 (GPT-style; off by default — cuts frequency & adds gates) ---
     strategy_evolution_v2_enabled: bool = Field(

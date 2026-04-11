@@ -34,6 +34,6 @@ $payload = @{
 
 Invoke-RestMethod `
     -Method Post `
-    -Uri "http://127.0.0.1:8091/memory/notes" `
+    -Uri "http://127.0.0.1:8080/memory/notes" `
     -ContentType "application/json" `
     -Body $payload

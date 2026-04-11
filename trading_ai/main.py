@@ -32,7 +32,7 @@ from trading_ai.core.patterns import (
 )
 from trading_ai.core.performance import PerformanceTracker
 from trading_ai.core.performance_monitor import PerformanceMonitor
-from trading_ai.core.runtime_state import load_runtime_state, save_runtime_state
+from trading_ai.core.runtime_state import load_runtime_positions_state, save_runtime_state
 from trading_ai.core.portfolio_intelligence import (
     build_portfolio_votes,
     classify_regime,
@@ -282,6 +282,125 @@ def _hard_market_filters(
     return None
 
 
+async def _estimate_account_equity(broker: Broker, settings: Settings) -> float:
+    getter = getattr(broker, "get_account_equity", None)
+    if callable(getter):
+        try:
+            equity = await asyncio.to_thread(getter)
+            if equity is not None and float(equity) > 0:
+                return float(equity)
+        except Exception as exc:
+            log.warning("Risk cap equity probe failed: %s", exc)
+    return float(settings.risk_equity_fallback_usd)
+
+
+async def _cap_trade_volume_for_exposure(
+    *,
+    broker: Broker,
+    execution: ExecutionService,
+    settings: Settings,
+    symbol: str,
+    action: str,
+    requested_volume: float,
+    confidence: float,
+) -> tuple[float, str]:
+    if action not in ("BUY", "SELL"):
+        return 0.0, "not_entry"
+
+    side_positions = [p for p in execution.positions_for(symbol) if p.side == action]
+    if side_positions and not settings.pyramiding_enabled:
+        return 0.0, "pyramiding_disabled"
+    if side_positions and confidence < settings.pyramid_add_min_confidence:
+        return 0.0, f"pyramid_confidence_low:{confidence:.3f}<{settings.pyramid_add_min_confidence:.3f}"
+    if len(side_positions) >= settings.pyramid_max_positions_per_side:
+        return 0.0, f"pyramid_position_cap:{len(side_positions)}>={settings.pyramid_max_positions_per_side}"
+
+    equity = await _estimate_account_equity(broker, settings)
+    equity_cap = max(0.0, equity / 1000.0 * float(settings.risk_max_lot_per_1000_equity))
+    hard_cap = float(settings.risk_max_total_lot_per_symbol)
+    cap = min(hard_cap, equity_cap) if hard_cap > 0 else equity_cap
+    current = execution.total_volume(symbol, action) if side_positions else 0.0
+    remaining = max(0.0, cap - current)
+    min_lot = max(0.0, float(settings.risk_min_order_lot))
+
+    if remaining + 1e-12 < min_lot:
+        return 0.0, f"exposure_cap_full:current={current:.4f}:cap={cap:.4f}:equity={equity:.2f}"
+
+    allowed = min(float(requested_volume), remaining)
+    if allowed + 1e-12 < min_lot:
+        return 0.0, f"order_below_min_lot:allowed={allowed:.4f}:min={min_lot:.4f}"
+    if allowed < float(requested_volume):
+        return allowed, f"volume_capped:{requested_volume:.4f}->{allowed:.4f}:cap={cap:.4f}:equity={equity:.2f}"
+    return float(requested_volume), f"volume_ok:current={current:.4f}:cap={cap:.4f}:equity={equity:.2f}"
+
+
+async def _reconcile_open_positions_from_broker(
+    broker: Broker,
+    settings: Settings,
+) -> list[OpenPosition]:
+    runner = getattr(broker, "_run_worker", None)
+    if not callable(runner):
+        return []
+    account_id = _safe_int_account(settings.ctrader_account_id)
+    if not account_id:
+        return []
+    payload = {
+        "account_id": int(account_id),
+        "symbol": settings.symbol,
+        "lookback_hours": 72,
+        "max_rows": 100,
+    }
+    try:
+        data = await asyncio.to_thread(runner, "reconcile", payload)
+    except Exception as exc:
+        log.warning("Startup broker reconcile failed: %s", exc)
+        return []
+    if not bool(data.get("ok")):
+        log.warning(
+            "Startup broker reconcile returned status=%s message=%s",
+            data.get("status"),
+            str(data.get("message") or "")[:220],
+        )
+        return []
+    scale = max(1, int(settings.ctrader_worker_volume_scale))
+
+    # Dexter worker order volume uses DEFAULT_VOLUME * scale, but cTrader reconcile
+    # returns open-position volume in a centi-unit of that worker payload.
+    # Example seen in production demo:
+    #   requested DEFAULT_VOLUME=0.01 -> worker volume=1 -> reconcile raw volume=100
+    # Convert back into Mempalace lot-sized units so exposure caps and pyramiding
+    # continue to operate on the same unit used at order entry time.
+    broker_to_lot_divisor = float(scale * 100)
+    positions: list[OpenPosition] = []
+    for row in list(data.get("positions") or []):
+        try:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if symbol != settings.symbol.upper():
+                continue
+            direction = str(row.get("direction") or "").strip().lower()
+            side = "BUY" if direction == "long" else "SELL" if direction == "short" else ""
+            if not side:
+                continue
+            raw_volume = float(row.get("volume") or 0.0)
+            if raw_volume <= 0:
+                continue
+            opened_ms = float(row.get("open_timestamp_ms") or row.get("updated_timestamp_ms") or 0.0)
+            positions.append(
+                OpenPosition(
+                    order_id=str(row.get("position_id") or row.get("order_id") or f"reconcile_{len(positions)+1}"),
+                    symbol=symbol,
+                    side=side,  # type: ignore[arg-type]
+                    volume=raw_volume / broker_to_lot_divisor,
+                    entry_price=float(row.get("entry_price") or 0.0),
+                    position_id=str(row.get("position_id") or "") or None,
+                    opened_ts=(opened_ms / 1000.0) if opened_ms > 0 else 0.0,
+                )
+            )
+        except Exception as exc:
+            log.warning("Skipping startup reconciled position row=%s err=%s", row, exc)
+    return positions
+
+
 async def learning_loop(settings: Settings) -> None:
     memory = build_memory(settings)
     broker = build_broker(settings)
@@ -330,18 +449,37 @@ async def learning_loop(settings: Settings) -> None:
         alert_min_llm_intents=settings.performance_alert_min_llm_intents,
     )
 
-    open_context: Optional[Dict[str, Any]] = None
-    restored_position, restored_context, restored_risk = load_runtime_state(settings.runtime_state_path)
-    if restored_position is not None:
-        execution.restore_position(restored_position)
-        open_context = restored_context
+    open_contexts: List[Dict[str, Any]] = []
+    restored_positions, restored_contexts, restored_risk = load_runtime_positions_state(settings.runtime_state_path)
+    if restored_positions:
+        execution.restore_positions(restored_positions)
+        open_contexts = list(restored_contexts)
+        while open_contexts and len(open_contexts) > len(restored_positions):
+            open_contexts.pop(0)
+        while open_contexts and len(open_contexts) < len(restored_positions):
+            open_contexts.insert(0, dict(open_contexts[0]))
+        latest = restored_positions[-1]
         log.warning(
-            "Restored open position from runtime state: %s %s volume=%s position_id=%s",
-            restored_position.side,
-            restored_position.symbol,
-            restored_position.volume,
-            restored_position.position_id,
+            "Restored %s open position(s) from runtime state; latest=%s %s volume=%s position_id=%s",
+            len(restored_positions),
+            latest.side,
+            latest.symbol,
+            latest.volume,
+            latest.position_id,
         )
+    else:
+        broker_positions = await _reconcile_open_positions_from_broker(broker, settings)
+        if broker_positions:
+            execution.restore_positions(broker_positions)
+            latest = broker_positions[-1]
+            log.warning(
+                "Reconciled %s open position(s) from broker at startup; latest=%s %s volume=%s position_id=%s",
+                len(broker_positions),
+                latest.side,
+                latest.symbol,
+                latest.volume,
+                latest.position_id,
+            )
     if restored_risk:
         risk.restore(restored_risk)
         log.info("Restored runtime risk state: %s", risk.snapshot())
@@ -350,7 +488,9 @@ async def learning_loop(settings: Settings) -> None:
         save_runtime_state(
             settings.runtime_state_path,
             open_position=execution.open_position_for(settings.symbol),
-            open_context=open_context,
+            open_context=open_contexts[-1] if open_contexts else None,
+            open_positions=execution.positions_for(settings.symbol),
+            open_contexts=open_contexts,
             risk=risk,
         )
 
@@ -750,6 +890,40 @@ async def learning_loop(settings: Settings) -> None:
                     settings.default_volume,
                     trade_volume,
                 )
+            if decision.action in ("BUY", "SELL"):
+                capped_volume, cap_reason = await _cap_trade_volume_for_exposure(
+                    broker=broker,
+                    execution=execution,
+                    settings=settings,
+                    symbol=settings.symbol,
+                    action=decision.action,
+                    requested_volume=trade_volume,
+                    confidence=float(decision.confidence),
+                )
+                if capped_volume <= 0:
+                    log.warning(
+                        "Exposure cap - overriding %s to HOLD: %s",
+                        decision.action,
+                        cap_reason,
+                    )
+                    decision = Decision(
+                        action="HOLD",
+                        confidence=0.0,
+                        reason=f"{decision.reason}|exposure_cap:{cap_reason}",
+                        raw={**dict(decision.raw), "exposure_cap": cap_reason},
+                    )
+                    trade_volume = 0.0
+                else:
+                    if abs(capped_volume - trade_volume) > 1e-9:
+                        log.info(
+                            "Exposure cap adjusted volume %s %s: %.4f -> %.4f (%s)",
+                            settings.symbol,
+                            decision.action,
+                            trade_volume,
+                            capped_volume,
+                            cap_reason,
+                        )
+                    trade_volume = capped_volume
 
             outcome = await execution.execute_trade(
                 symbol=settings.symbol,
@@ -759,103 +933,141 @@ async def learning_loop(settings: Settings) -> None:
                 dry_run=settings.dry_run,
             )
 
-            if outcome.close is not None and open_context is not None:
-                close = outcome.close
-                notional = close.notional_approx()
-                tscore = evaluate_outcome(
-                    close.pnl,
-                    notional=notional,
-                    neutral_rel_threshold=settings.neutral_pnl_threshold,
-                )
-                score_int = int(tscore)
+            closed_positions = list(outcome.closes or ([] if outcome.close is None else [outcome.close]))
+            if closed_positions:
+                closed_contexts = list(open_contexts[: len(closed_positions)])
+                if len(closed_contexts) < len(closed_positions):
+                    log.warning(
+                        "Close context mismatch: closes=%s contexts=%s for %s",
+                        len(closed_positions),
+                        len(closed_contexts),
+                        settings.symbol,
+                    )
+                for idx, close in enumerate(closed_positions):
+                    notional = close.notional_approx()
+                    tscore = evaluate_outcome(
+                        close.pnl,
+                        notional=notional,
+                        neutral_rel_threshold=settings.neutral_pnl_threshold,
+                    )
+                    score_int = int(tscore)
+                    close_context = closed_contexts[idx] if idx < len(closed_contexts) else None
 
-                sk_close = str(open_context.get("strategy_key") or "")
-                record = MemoryRecord(
-                    market=dict(open_context["market"]),
-                    features=dict(open_context["features"]),
-                    decision=dict(open_context["decision"]),
-                    result={
-                        "pnl": close.pnl,
-                        "exit_price": close.exit_price,
-                        "entry_price": close.entry_price,
-                    },
-                    score=score_int,
-                    setup_tag=str(open_context["setup_tag"]),
-                    strategy_key=sk_close,
-                    journal=str(open_context["journal"]),
-                    tags=list(open_context.get("tags") or []),
-                )
-                memory.store_memory(
-                    record,
-                    extra_metadata={
-                        "trade_score": score_int,
-                        "strategy_key": sk_close,
-                    },
-                )
-                closed_confidence = float((open_context.get("decision") or {}).get("confidence") or 0.0)
-                current_room = str(sk_close or build_strategy_key(dict(open_context["features"]), str(open_context["setup_tag"])))
-                if score_int < 0 and closed_confidence >= 0.75:
-                    memory.store_note(
-                        MemoryNote(
-                            title="Overconfident loss",
-                            content=(
-                                f"Loss recorded in room={current_room} with confidence={closed_confidence:.3f} "
-                                f"pnl={float(close.pnl):.6f}. Treat as anti-pattern candidate until more evidence arrives."
-                            ),
-                            wing=f"symbol:{str(settings.symbol).lower()}",
-                            hall="hall_discoveries",
-                            room=current_room,
-                            note_type="anti_pattern_candidate",
-                            hall_type="hall_discoveries",
-                            symbol=settings.symbol,
-                            session=str(open_context["features"].get("session") or ""),
-                            setup_tag=str(open_context["setup_tag"]),
+                    if close_context is not None:
+                        sk_close = str(close_context.get("strategy_key") or "")
+                        record = MemoryRecord(
+                            market=dict(close_context["market"]),
+                            features=dict(close_context["features"]),
+                            decision=dict(close_context["decision"]),
+                            result={
+                                "pnl": close.pnl,
+                                "exit_price": close.exit_price,
+                                "entry_price": close.entry_price,
+                            },
+                            score=score_int,
+                            setup_tag=str(close_context["setup_tag"]),
                             strategy_key=sk_close,
-                            importance=0.9,
-                            source="trade_close",
-                            tags=["anti-pattern", "overconfident-loss", current_room],
+                            journal=str(close_context["journal"]),
+                            tags=list(close_context.get("tags") or []),
                         )
-                    )
-                elif score_int > 0 and closed_confidence < 0.55:
-                    memory.store_note(
-                        MemoryNote(
-                            title="Underconfident win",
-                            content=(
-                                f"Win recorded in room={current_room} with confidence={closed_confidence:.3f} "
-                                f"pnl={float(close.pnl):.6f}. This may be an opportunity room worth promoting."
-                            ),
-                            wing=f"symbol:{str(settings.symbol).lower()}",
-                            hall="hall_discoveries",
-                            room=current_room,
-                            note_type="opportunity_candidate",
-                            hall_type="hall_discoveries",
-                            symbol=settings.symbol,
-                            session=str(open_context["features"].get("session") or ""),
-                            setup_tag=str(open_context["setup_tag"]),
-                            strategy_key=sk_close,
-                            importance=0.78,
-                            source="trade_close",
-                            tags=["opportunity", "underconfident-win", current_room],
+                        memory.store_memory(
+                            record,
+                            extra_metadata={
+                                "trade_score": score_int,
+                                "strategy_key": sk_close,
+                            },
                         )
-                    )
-                risk.on_trade_result(tscore, pnl=close.pnl)
-                perf.record_close(close.pnl, score=score_int)
-                if settings.performance_monitor_enabled:
-                    perf_mon.update_on_trade(float(close.pnl), score_int)
-                if sk_close:
-                    registry.update_strategy(
-                        sk_close,
-                        {"pnl": float(close.pnl), "score": score_int},
-                    )
-                    if settings.correlation_engine_enabled and correlation is not None:
-                        correlation.update_pnl(sk_close, float(close.pnl))
-                pattern_book.append_closed_trade(
-                    features=dict(open_context["features"]),
-                    setup_tag=str(open_context["setup_tag"]),
-                    score=score_int,
-                    pnl=float(close.pnl),
-                )
-                open_context = None
+                        closed_confidence = float((close_context.get("decision") or {}).get("confidence") or 0.0)
+                        current_room = str(
+                            sk_close
+                            or build_strategy_key(
+                                dict(close_context["features"]),
+                                str(close_context["setup_tag"]),
+                            )
+                        )
+                        if score_int < 0 and closed_confidence >= 0.75:
+                            memory.store_note(
+                                MemoryNote(
+                                    title="Overconfident loss",
+                                    content=(
+                                        f"Loss recorded in room={current_room} with confidence={closed_confidence:.3f} "
+                                        f"pnl={float(close.pnl):.6f}. Treat as anti-pattern candidate until more evidence arrives."
+                                    ),
+                                    wing=f"symbol:{str(settings.symbol).lower()}",
+                                    hall="hall_discoveries",
+                                    room=current_room,
+                                    note_type="anti_pattern_candidate",
+                                    hall_type="hall_discoveries",
+                                    symbol=settings.symbol,
+                                    session=str(close_context["features"].get("session") or ""),
+                                    setup_tag=str(close_context["setup_tag"]),
+                                    strategy_key=sk_close,
+                                    importance=0.9,
+                                    source="trade_close",
+                                    tags=["anti-pattern", "overconfident-loss", current_room],
+                                )
+                            )
+                        elif score_int > 0 and closed_confidence < 0.55:
+                            memory.store_note(
+                                MemoryNote(
+                                    title="Underconfident win",
+                                    content=(
+                                        f"Win recorded in room={current_room} with confidence={closed_confidence:.3f} "
+                                        f"pnl={float(close.pnl):.6f}. This may be an opportunity room worth promoting."
+                                    ),
+                                    wing=f"symbol:{str(settings.symbol).lower()}",
+                                    hall="hall_discoveries",
+                                    room=current_room,
+                                    note_type="opportunity_candidate",
+                                    hall_type="hall_discoveries",
+                                    symbol=settings.symbol,
+                                    session=str(close_context["features"].get("session") or ""),
+                                    setup_tag=str(close_context["setup_tag"]),
+                                    strategy_key=sk_close,
+                                    importance=0.78,
+                                    source="trade_close",
+                                    tags=["opportunity", "underconfident-win", current_room],
+                                )
+                            )
+                        if sk_close:
+                            registry.update_strategy(
+                                sk_close,
+                                {"pnl": float(close.pnl), "score": score_int},
+                            )
+                            if settings.correlation_engine_enabled and correlation is not None:
+                                correlation.update_pnl(sk_close, float(close.pnl))
+                        pattern_book.append_closed_trade(
+                            features=dict(close_context["features"]),
+                            setup_tag=str(close_context["setup_tag"]),
+                            score=score_int,
+                            pnl=float(close.pnl),
+                        )
+                    else:
+                        memory.store_note(
+                            MemoryNote(
+                                title="Close without context",
+                                content=(
+                                    f"Closed {close.side} {close.symbol} without matching open context. "
+                                    f"entry={close.entry_price:.5f} exit={close.exit_price:.5f} pnl={float(close.pnl):.6f}"
+                                ),
+                                wing="execution",
+                                hall="hall_events",
+                                room=f"close-without-context:{str(settings.symbol).lower()}",
+                                note_type="runtime_gap",
+                                hall_type="hall_events",
+                                symbol=settings.symbol,
+                                importance=0.7,
+                                source="learning_loop",
+                                tags=["runtime-gap", "close-without-context", close.side.lower()],
+                            )
+                        )
+
+                    risk.on_trade_result(tscore, pnl=close.pnl)
+                    perf.record_close(close.pnl, score=score_int)
+                    if settings.performance_monitor_enabled:
+                        perf_mon.update_on_trade(float(close.pnl), score_int)
+
+                open_contexts = open_contexts[len(closed_positions) :]
                 persist_runtime_state()
 
             opened = (
@@ -897,7 +1109,8 @@ async def learning_loop(settings: Settings) -> None:
             if opened and (outcome.trade.executed or settings.dry_run):
                 tag = infer_setup_tag(features, decision.action)
                 sk_open = build_strategy_key(features, tag)
-                open_context = {
+                open_contexts.append(
+                    {
                     "market": market.as_prompt_dict(),
                     "features": dict(features),
                     "decision": {
@@ -916,7 +1129,8 @@ async def learning_loop(settings: Settings) -> None:
                         strategy_key=sk_open,
                     ),
                     "tags": [settings.symbol, tag, str(features.get("session", "")), sk_open],
-                }
+                    }
+                )
                 persist_runtime_state()
 
             if memory.count() > 0:
